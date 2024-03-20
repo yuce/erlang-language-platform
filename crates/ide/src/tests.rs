@@ -13,6 +13,7 @@
 use elp_ide_assists::Assist;
 use elp_ide_db::elp_base_db::assert_eq_text;
 use elp_ide_db::elp_base_db::fixture::extract_annotations;
+use elp_ide_db::elp_base_db::fixture::remove_annotations;
 use elp_ide_db::elp_base_db::fixture::WithFixture;
 use elp_ide_db::elp_base_db::FileId;
 use elp_ide_db::elp_base_db::FileRange;
@@ -150,9 +151,13 @@ pub(crate) fn check_nth_fix(
 ) {
     let after = trim_indent(fixture_after);
 
-    let (db, file_position, _) = RootDatabase::with_position(fixture_before);
-    let diagnostic = diagnostics::native_diagnostics(&db, &config, file_position.file_id)
-        .iter()
+    let (analysis, pos, diagnostics_enabled) = fixture::position(fixture_before);
+
+    let diagnostics =
+        fixture::diagnostics_for(&analysis, pos.file_id, &config, &diagnostics_enabled);
+    let diagnostic = diagnostics
+        .diagnostics_for(pos.file_id)
+        .into_iter()
         .last()
         .expect("no diagnostics")
         .clone();
@@ -160,18 +165,19 @@ pub(crate) fn check_nth_fix(
     let actual = {
         let source_change = fix.source_change.as_ref().unwrap();
         let file_id = *source_change.source_file_edits.keys().next().unwrap();
-        let mut actual = db.file_text(file_id).to_string();
+        let mut actual = analysis.db.file_text(file_id).to_string();
 
         for edit in source_change.source_file_edits.values() {
             edit.apply(&mut actual);
         }
         actual
     };
+    let actual = remove_annotations(None, &actual);
     assert!(
-        fix.target.contains_inclusive(file_position.offset),
+        fix.target.contains_inclusive(pos.offset),
         "diagnostic fix range {:?} does not touch cursor position {:?}",
         fix.target,
-        file_position.offset
+        pos.offset
     );
     assert_eq_text!(&after, &actual);
 }
@@ -186,50 +192,69 @@ pub(crate) fn check_specific_fix(assist_label: &str, fixture_before: &str, fixtu
     let config = DiagnosticsConfig::default()
         .disable(DiagnosticCode::MissingCompileWarnMissingSpec)
         .set_experimental(true);
-    check_specific_fix_with_config(Some(assist_label), 0, fixture_before, fixture_after, config);
+    check_specific_fix_with_config(Some(assist_label), fixture_before, fixture_after, config);
 }
 
 #[track_caller]
 pub(crate) fn check_specific_fix_with_config(
     assist_label: Option<&str>,
-    nth: usize,
     fixture_before: &str,
     fixture_after: &str,
     config: DiagnosticsConfig,
 ) {
     let after = trim_indent(fixture_after);
 
-    let (db, file_position, _) = RootDatabase::with_position(fixture_before);
-    let diagnostics = diagnostics::native_diagnostics(&db, &config, file_position.file_id);
-    let diagnostic: &Diagnostic = if let Some(label) = assist_label {
-        if let Some(diagnostic) = diagnostics.iter().find(|d| d.message == label) {
-            diagnostic
+    let (analysis, pos, diagnostics_enabled) = fixture::position(fixture_before);
+    let diagnostics =
+        fixture::diagnostics_for(&analysis, pos.file_id, &config, &diagnostics_enabled);
+    let diagnostics = diagnostics.diagnostics_for(pos.file_id);
+    let fix: &Assist = if let Some(label) = assist_label {
+        if let Some(fix) = diagnostics
+            .iter()
+            .filter_map(|d| {
+                d.fixes
+                    .as_ref()
+                    .and_then(|fixes| fixes.into_iter().find(|f| f.label == label))
+            })
+            .next()
+        {
+            &fix
         } else {
             panic!(
                 "Expecting \"{}\", but not found in {:?}",
                 label,
-                diagnostics.iter().map(|d| d.message.clone()).collect_vec()
+                diagnostics
+                    .iter()
+                    .flat_map(|d| match d.fixes.as_ref() {
+                        None => vec![],
+                        Some(fixes) => fixes
+                            .iter()
+                            .map(|f| (d.code.clone(), f.label.clone()))
+                            .collect_vec(),
+                    })
+                    .collect_vec()
             );
         }
     } else {
-        diagnostics.iter().next().expect("no diagnostics")
+        panic!("No assists found");
     };
-    let fix = &diagnostic.clone().fixes.expect("diagnostic misses fixes")[nth];
+
     let actual = {
         let source_change = fix.source_change.as_ref().unwrap();
         let file_id = *source_change.source_file_edits.keys().next().unwrap();
-        let mut actual = db.file_text(file_id).to_string();
+        let mut actual = analysis.db.file_text(file_id).to_string();
 
         for edit in source_change.source_file_edits.values() {
             edit.apply(&mut actual);
         }
         actual
     };
+    let actual = remove_annotations(None, &actual);
     assert!(
-        fix.target.contains_inclusive(file_position.offset),
+        fix.target.contains_inclusive(pos.offset),
         "diagnostic fix range {:?} does not touch cursor position {:?}",
         fix.target,
-        file_position.offset
+        pos.offset
     );
     assert_eq_text!(&after, &actual);
 }
@@ -413,8 +438,9 @@ pub fn check_call_hierarchy(prepare_fixture: &str, incoming_fixture: &str, outgo
 }
 
 fn check_call_hierarchy_prepare(fixture: &str) {
-    let (analysis, pos, _diagnostics_enabled, mut annotations) =
-        fixture::annotations(trim_indent(fixture).as_str());
+    let trimmed_fixture = trim_indent(fixture);
+    let (analysis, pos, _diagnostics_enabled, _guard, mut annotations) =
+        fixture::annotations(trimmed_fixture.as_str());
     let mut navs = analysis.call_hierarchy_prepare(pos).unwrap().unwrap().info;
     assert_eq!(navs.len(), 1);
     assert_eq!(annotations.len(), 1);
@@ -428,8 +454,9 @@ fn check_call_hierarchy_prepare(fixture: &str) {
 }
 
 fn check_call_hierarchy_incoming_calls(fixture: &str) {
-    let (analysis, pos, _diagnostics_enabled, mut expected) =
-        fixture::annotations(trim_indent(fixture).as_str());
+    let trimmed_fixture = trim_indent(fixture);
+    let (analysis, pos, _diagnostics_enabled, _guard, mut expected) =
+        fixture::annotations(trimmed_fixture.as_str());
     let incoming_calls = analysis.incoming_calls(pos).unwrap().unwrap();
     let mut actual = Vec::new();
     for call in incoming_calls {
@@ -458,8 +485,9 @@ fn check_call_hierarchy_incoming_calls(fixture: &str) {
 }
 
 fn check_call_hierarchy_outgoing_calls(fixture: &str) {
-    let (analysis, pos, _diagnostics_enabled, mut expected) =
-        fixture::annotations(trim_indent(fixture).as_str());
+    let trimmed_fixture = trim_indent(fixture);
+    let (analysis, pos, _diagnostics_enabled, _guard, mut expected) =
+        fixture::annotations(trimmed_fixture.as_str());
     let outgoing_calls = analysis.outgoing_calls(pos).unwrap().unwrap();
     let mut actual = Vec::new();
     for call in outgoing_calls {
